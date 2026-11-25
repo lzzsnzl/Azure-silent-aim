@@ -1,0 +1,409 @@
+local env = (typeof(getgenv) == "function" and getgenv()) or _G
+if type(env.__AZ_SILENT_UNLOAD) == "function" then pcall(env.__AZ_SILENT_UNLOAD) end
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local Stats = game:GetService("Stats")
+
+local LocalPlayer = Players.LocalPlayer
+if not LocalPlayer then return end
+
+local hookFn = (typeof(hookfunction) == "function" and hookfunction)
+	or (typeof(replaceclosure) == "function" and replaceclosure)
+
+local BEAM_STEP = "__AZ_ENSTRANGLE_LOCK"
+local HOOK_EVENT = LocalPlayer.Name .. "AzureUpdateCameraLookVector"
+
+-- Valores medidos de ReplicatedStorage.Assets.Killers.Azure.Config
+local CONFIG = {
+	GateEnabled = true,
+	HookRange = 60,
+	HookSpeed = 270,
+	RangeMargin = 2.0,
+	AimOffset = -0.15,
+	ToF_Iterations = 5,
+	BaseDelay = 0.055,
+	PingFactor = 0.90,
+	MaxScreenAngleDeg = 95,
+	Predict = {
+		VelBlend = 0.62,
+		MoveDirBlend = 0.28,
+		StationarySpeed = 1.2,
+		WalkThreshold = 17.5,
+		Walk = { LeadMult = 1.06, ExtraLead = 0.02, Smooth = 0.70, MinConf = 0.65 },
+		Sprint = { LeadMult = 1.03, ExtraLead = 0.015, Smooth = 0.58, MinConf = 0.45 },
+		AccelSmooth = 0.25,
+		AccelClamp = 85,
+		AccelWeight = 0.16,
+		JukeDot = 0.10,
+		ConfRecovery = 5.5,
+		CurveWeight = 0.55,
+		MaxYawRate = 3.2,
+		MaxCurveAngle = 0.58,
+		MaxLeadTime = 0.85,
+		SpeedCap = 36,
+	},
+}
+
+local wallParams = RaycastParams.new()
+wallParams.FilterType = Enum.RaycastFilterType.Exclude
+wallParams.CollisionGroup = "Killers"
+wallParams.RespectCanCollide = true
+wallParams.IgnoreWater = true
+
+local motion = setmetatable({}, { __mode = "k" })
+local cachedPing, lastPingAt = 0.05, 0
+local lockedRoot, lockedHum, currentAimPos
+local networkMod, origFireServer, hookedViaClosure, isHooked = nil, nil, false, false
+local actorsMod, hbConn
+local unloaded = false
+
+local function getActor(char)
+	if not actorsMod then
+		local m = ReplicatedStorage:FindFirstChild("Modules")
+		local g = m and m:FindFirstChild("Gameplay")
+		local a = g and g:FindFirstChild("Actors")
+		if a and a:IsA("ModuleScript") then
+			local ok, mod = pcall(require, a)
+			if ok and type(mod) == "table" then actorsMod = mod end
+		end
+	end
+	local list = actorsMod and actorsMod.CurrentActors
+	if type(list) ~= "table" then return nil end
+	local direct = list[LocalPlayer]
+	if type(direct) == "table" then return direct end
+	for _, act in pairs(list) do
+		if type(act) == "table" and (act.Player == LocalPlayer or (char and act.Rig == char)) then
+			return act
+		end
+	end
+	return nil
+end
+
+local function localContext()
+	local char = LocalPlayer.Character
+	if not char then return nil end
+	local actor = getActor(char)
+	if actor and actor.State and actor.State.ControllingGolem ~= nil then return nil end
+	if CONFIG.GateEnabled then
+		local name = tostring(char:GetAttribute("CharacterName") or char.Name):lower()
+		if not name:find("azure", 1, true) and not (actor and actor.Config and tostring(actor.Config.DisplayName or ""):lower() == "azure") then
+			return nil
+		end
+	end
+	local root = char.PrimaryPart or char:FindFirstChild("HumanoidRootPart")
+	return root, char, actor
+end
+
+local function getPing()
+	local now = os.clock()
+	if now - lastPingAt >= 0.25 then
+		lastPingAt = now
+		local ok, ms = pcall(function() return Stats.Network.ServerStatsItem["Data Ping"]:GetValue() end)
+		if ok and type(ms) == "number" and ms == ms then
+			cachedPing = math.clamp((ms / 1000) * CONFIG.PingFactor, 0.03, 0.40)
+		else
+			local ok2, sec = pcall(function() return LocalPlayer:GetNetworkPing() end)
+			if ok2 and type(sec) == "number" and sec == sec then
+				cachedPing = math.clamp(sec * CONFIG.PingFactor, 0.03, 0.40)
+			end
+		end
+	end
+	return cachedPing
+end
+
+local function eachSurvivor(char, visit)
+	local pf = Workspace:FindFirstChild("Players")
+	local folder = pf and pf:FindFirstChild("Survivors")
+	if not folder then return end
+	for _, model in ipairs(folder:GetChildren()) do
+		if model ~= char and model:IsA("Model") then
+			local root = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+			local hum = model:FindFirstChildOfClass("Humanoid")
+			if root and hum and hum.Health > 0 then visit(root, hum) end
+		end
+	end
+end
+
+local function sampleTarget(root, hum)
+	local pos, now = root.Position, os.clock()
+	local state = hum:GetState()
+	local airborne = state == Enum.HumanoidStateType.Freefall or state == Enum.HumanoidStateType.Jumping
+	local asmVel = root.AssemblyLinearVelocity
+	local d = motion[root]
+
+	if not d then
+		motion[root] = { pos = pos, time = now, vel = asmVel, lastVel = asmVel, accel = Vector3.zero, yawRate = 0, conf = 1.0, airborne = airborne, isWalking = false }
+		return
+	end
+
+	local dt = now - d.time
+	if dt < 0.015 then return end
+
+	local P = CONFIG.Predict
+	local rawVel = ((pos - d.pos) / dt):Lerp(asmVel, 1 - P.VelBlend)
+	local flatRaw = Vector3.new(rawVel.X, 0, rawVel.Z)
+
+	local moveDir = hum.MoveDirection
+	if moveDir.Magnitude > 0.1 then
+		local moveFlat = Vector3.new(moveDir.X, 0, moveDir.Z)
+		if moveFlat.Magnitude > 1e-4 then
+			local desired = math.max(flatRaw.Magnitude, math.min(hum.WalkSpeed, P.SpeedCap))
+			flatRaw = flatRaw:Lerp(moveFlat.Unit * desired, flatRaw.Magnitude < 2.0 and 0.60 or P.MoveDirBlend)
+			rawVel = Vector3.new(flatRaw.X, rawVel.Y, flatRaw.Z)
+		end
+	end
+
+	local flatMag = flatRaw.Magnitude
+	if flatMag > P.SpeedCap then
+		flatRaw = flatRaw.Unit * P.SpeedCap
+		rawVel = Vector3.new(flatRaw.X, rawVel.Y, flatRaw.Z)
+		flatMag = P.SpeedCap
+	end
+
+	if flatMag < P.StationarySpeed and not airborne then
+		d.vel = d.vel:Lerp(Vector3.zero, 0.75)
+		d.accel = d.accel * 0.2
+		d.yawRate = d.yawRate * 0.2
+		d.conf = math.min(1.0, d.conf + dt * P.ConfRecovery)
+		d.lastVel, d.pos, d.time, d.airborne, d.isWalking = d.vel, pos, now, false, false
+		return
+	end
+
+	local isWalking = flatMag <= P.WalkThreshold
+	local profile = isWalking and P.Walk or P.Sprint
+
+	local prevFlat = Vector3.new(d.vel.X, 0, d.vel.Z)
+	if prevFlat.Magnitude > 2.0 and flatMag > 2.0 then
+		local pDir, nDir = prevFlat.Unit, flatRaw.Unit
+		local dot = math.clamp(pDir:Dot(nDir), -1, 1)
+		if dot < P.JukeDot then
+			d.conf = math.min(d.conf, math.clamp((dot + 1) * 0.5, profile.MinConf, 1.0))
+			d.accel = d.accel * 0.25
+			d.yawRate = 0
+		else
+			d.conf = math.min(1.0, d.conf + dt * P.ConfRecovery)
+			local yaw = math.clamp(math.atan2(pDir.Z * nDir.X - pDir.X * nDir.Z, dot) / dt, -P.MaxYawRate, P.MaxYawRate)
+			d.yawRate = d.yawRate + (yaw - d.yawRate) * 0.30
+		end
+	else
+		d.conf = math.min(1.0, d.conf + dt * P.ConfRecovery)
+		d.yawRate = d.yawRate * 0.5
+	end
+
+	d.vel = d.vel:Lerp(rawVel, profile.Smooth)
+
+	local rawAccel = (d.vel - d.lastVel) / dt
+	if rawAccel.Magnitude > P.AccelClamp then rawAccel = rawAccel.Unit * P.AccelClamp end
+	local w = airborne and 0.15 or P.AccelWeight
+	d.accel = d.accel:Lerp(Vector3.new(rawAccel.X * w, 0, rawAccel.Z * w), P.AccelSmooth)
+
+	d.lastVel, d.pos, d.time, d.airborne, d.isWalking = d.vel, pos, now, airborne, isWalking
+end
+
+local function predictPos(root, leadTime)
+	local P = CONFIG.Predict
+	local d = motion[root]
+	local base = root.Position + Vector3.new(0, CONFIG.AimOffset, 0)
+	local vel = d and d.vel or root.AssemblyLinearVelocity
+	local accel = d and d.accel or Vector3.zero
+	local conf = d and d.conf or 1.0
+	local airborne = d and d.airborne or false
+	local yawRate = d and d.yawRate or 0
+
+	local flatSpeed = Vector3.new(vel.X, 0, vel.Z).Magnitude
+	if flatSpeed < P.StationarySpeed and not airborne then return base end
+
+	local profile = (d and d.isWalking or flatSpeed <= P.WalkThreshold) and P.Walk or P.Sprint
+	local t = math.clamp((leadTime + profile.ExtraLead) * profile.LeadMult, 0, P.MaxLeadTime)
+	local et = t * conf
+
+	local vx, vz = vel.X, vel.Z
+	if math.abs(yawRate) > 0.15 and flatSpeed > 3.0 and conf > 0.65 then
+		local ang = math.clamp(yawRate * et * P.CurveWeight * 0.5, -P.MaxCurveAngle, P.MaxCurveAngle)
+		local c, s = math.cos(ang), math.sin(ang)
+		vx, vz = vx * c + vz * s, -vx * s + vz * c
+	end
+
+	local vy = airborne and (vel.Y * t - 0.5 * Workspace.Gravity * t * t) or (vel.Y * et)
+	local pred = base + Vector3.new(vx * et + 0.5 * accel.X * et * et, vy, vz * et + 0.5 * accel.Z * et * et)
+
+	local pf = Workspace:FindFirstChild("Players")
+	wallParams.FilterDescendantsInstances = pf and { pf } or { LocalPlayer.Character }
+
+	local moveVec = pred - base
+	if moveVec.Magnitude > 0.75 then
+		local hit = Workspace:Raycast(base, moveVec, wallParams)
+		if hit then
+			local stopPos = hit.Position - moveVec.Unit * 1.15
+			local rem = pred - hit.Position
+			local slide = rem - hit.Normal * rem:Dot(hit.Normal)
+			if slide.Magnitude > 0.35 then
+				local sHit = Workspace:Raycast(stopPos, slide * 0.85, wallParams)
+				pred = sHit and (sHit.Position - slide.Unit * 1.15) or (stopPos + slide * 0.85)
+			else
+				pred = stopPos
+			end
+		end
+	end
+
+	if pred.Y < base.Y - 2.5 then
+		local floor = Workspace:Raycast(Vector3.new(pred.X, base.Y + 1.0, pred.Z), Vector3.new(0, -60, 0), wallParams)
+		if floor then pred = Vector3.new(pred.X, math.max(pred.Y, floor.Position.Y + 2.0), pred.Z) end
+	end
+
+	return pred
+end
+
+local function solveHookAim(targetRoot, myRoot)
+	local baseDelay = CONFIG.BaseDelay + getPing()
+	local spawnPos = myRoot.Position + myRoot.AssemblyLinearVelocity * (baseDelay * 0.65)
+	local speed = CONFIG.HookSpeed
+
+	local t = (targetRoot.Position - spawnPos).Magnitude / speed
+	local aimPos = targetRoot.Position
+	for _ = 1, CONFIG.ToF_Iterations do
+		aimPos = predictPos(targetRoot, t + baseDelay)
+		local newT = (aimPos - spawnPos).Magnitude / speed
+		if math.abs(newT - t) < 0.004 then break end
+		t = newT
+	end
+
+	local delta = aimPos - spawnPos
+	local dist = delta.Magnitude
+	local reachable = dist <= (CONFIG.HookRange + CONFIG.RangeMargin)
+	if dist > CONFIG.HookRange and dist > 1e-3 then
+		aimPos = spawnPos + delta.Unit * CONFIG.HookRange
+	end
+	return aimPos, spawnPos, dist, reachable
+end
+
+local function pickSingleTarget(char, myRoot)
+	local cam = Workspace.CurrentCamera
+	if not cam then return nil end
+	local center = cam.ViewportSize * 0.5
+	local camPos, camLook = cam.CFrame.Position, cam.CFrame.LookVector
+	local maxCos = math.cos(math.rad(CONFIG.MaxScreenAngleDeg))
+	local maxPre = CONFIG.HookRange + 10
+
+	local bestRoot, bestHum, bestAim, bestScore
+	eachSurvivor(char, function(root, hum)
+		if (root.Position - myRoot.Position).Magnitude > maxPre then return end
+		local toT = root.Position - camPos
+		if toT.Magnitude > 1e-3 and camLook:Dot(toT.Unit) < maxCos then return end
+
+		local aimPos, spawnPos, dist, reachable = solveHookAim(root, myRoot)
+		if not reachable then return end
+
+		local scr, onScreen = cam:WorldToViewportPoint(aimPos)
+		local score = (onScreen and (Vector2.new(scr.X, scr.Y) - center).Magnitude or 8000) + dist * 3.0
+
+		local pf = Workspace:FindFirstChild("Players")
+		wallParams.FilterDescendantsInstances = pf and { pf } or { char }
+		if Workspace:Spherecast(spawnPos, 0.65, aimPos - spawnPos, wallParams) then
+			score = score + 6000
+		end
+
+		if not bestScore or score < bestScore then
+			bestRoot, bestHum, bestAim, bestScore = root, hum, aimPos, score
+		end
+	end)
+
+	return bestRoot, bestHum, bestAim
+end
+
+hbConn = RunService.Heartbeat:Connect(function()
+	local myRoot, char = localContext()
+	if myRoot then eachSurvivor(char, sampleTarget) end
+end)
+
+pcall(function() RunService:UnbindFromRenderStep(BEAM_STEP) end)
+RunService:BindToRenderStep(BEAM_STEP, Enum.RenderPriority.Camera.Value + 6, function()
+	if unloaded then return end
+	local myRoot, char, actor = localContext()
+	local st = actor and actor.State
+	if not (myRoot and st and (st.GrabAimingSequence == true or st.GrabAimingBeam ~= nil)) then
+		lockedRoot, lockedHum, currentAimPos = nil, nil, nil
+		return
+	end
+
+	local aimPos
+	if lockedRoot and lockedRoot.Parent and lockedHum and lockedHum.Health > 0 then
+		local p, _, _, reachable = solveHookAim(lockedRoot, myRoot)
+		if reachable then
+			aimPos = p
+		else
+			lockedRoot, lockedHum = nil, nil
+		end
+	else
+		lockedRoot, lockedHum = nil, nil
+	end
+
+	if not aimPos then
+		lockedRoot, lockedHum, aimPos = pickSingleTarget(char, myRoot)
+	end
+
+	if aimPos then
+		currentAimPos = aimPos
+		st.CameraLookPosition = aimPos
+		if not isHooked and networkMod and origFireServer and st.GrabAimingSequence == true then
+			pcall(origFireServer, networkMod, HOOK_EVENT, "UREMOTE_EVENT", aimPos)
+		end
+	else
+		currentAimPos = nil
+	end
+end)
+
+task.spawn(function()
+	local okNet, netMod = pcall(function()
+		return require(ReplicatedStorage:WaitForChild("Modules", 10):WaitForChild("Network", 10):WaitForChild("Network", 10))
+	end)
+	if not (okNet and type(netMod) == "table" and type(netMod.FireServerConnection) == "function") or unloaded then return end
+	networkMod = netMod
+
+	if hookFn then
+		local okH, orig = pcall(function()
+			return hookFn(netMod.FireServerConnection, function(self, connName, connType, ...)
+				if not unloaded and connType == "UREMOTE_EVENT" and connName == HOOK_EVENT and currentAimPos then
+					return origFireServer(self, connName, connType, currentAimPos)
+				end
+				return origFireServer(self, connName, connType, ...)
+			end)
+		end)
+		if okH and type(orig) == "function" then
+			origFireServer, hookedViaClosure, isHooked = orig, true, true
+			return
+		end
+	end
+
+	if not (typeof(table.isfrozen) == "function" and table.isfrozen(netMod)) then
+		origFireServer = netMod.FireServerConnection
+		isHooked = true
+		netMod.FireServerConnection = function(self, connName, connType, ...)
+			if not unloaded and connType == "UREMOTE_EVENT" and connName == HOOK_EVENT and currentAimPos then
+				return origFireServer(self, connName, connType, currentAimPos)
+			end
+			return origFireServer(self, connName, connType, ...)
+		end
+	else
+		origFireServer = netMod.FireServerConnection
+	end
+end)
+
+env.__AZ_SILENT_UNLOAD = function()
+	if unloaded then return end
+	unloaded = true
+	lockedRoot, lockedHum, currentAimPos = nil, nil, nil
+	pcall(function() RunService:UnbindFromRenderStep(BEAM_STEP) end)
+	if hbConn then pcall(function() hbConn:Disconnect() end) end
+	if networkMod and origFireServer then
+		if hookedViaClosure and hookFn then
+			pcall(hookFn, networkMod.FireServerConnection, origFireServer)
+		elseif isHooked and not (typeof(table.isfrozen) == "function" and table.isfrozen(networkMod)) then
+			pcall(function() networkMod.FireServerConnection = origFireServer end)
+		end
+	end
+	env.__AZ_SILENT_UNLOAD = nil
+end
